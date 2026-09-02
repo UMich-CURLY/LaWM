@@ -82,6 +82,34 @@ python scripts/rollout.py \
   --out-pt outputs/toy_rollout.pt
 ```
 
+## ⚖️ Gradient Stability of the DEL Rollout
+
+Backpropagating through the full rollout is numerically explosive by construction: the
+constant-velocity initialization `q_next = 2 q_curr - q_prev` has companion-matrix
+spectral radius (1 + sqrt(5)) / 2 ≈ 1.618, so a T-step rollout scales gradients by
+~1.618^T before the unrolled DEL corrections multiply them further. On fp32 this
+overflows on `examples/toy_parabolic.py` (T = 64), after which the solver's internal
+sanitizers keep emitting finite trajectories from the poisoned parameters — the
+trajectory loss then settles at the data's second moment and imitates convergence.
+
+Training therefore defaults to a stabilized gradient estimator; the forward rollout is
+unchanged (test-asserted):
+
+- `--solver-grad last_iterate` (default) iterates the DEL solve without a graph and
+  differentiates only the final correction, added onto the live initialization so
+  through-time credit still flows. `--solver-grad unrolled` restores exact backprop
+  through every solver iteration (Eq. 20 of the paper).
+- `--bptt-grad-clip 10.0` (default) bounds the backward norm once per rollout step,
+  taming the 1.618^T growth. `<= 0` disables it.
+- The train loop skips (and reports) optimizer steps whose gradients are non-finite
+  (`skipped_nonfinite_steps` in the log), so a sanitized collapse can no longer
+  masquerade as a learning curve. Treat a trajectory loss that plateaus at the data's
+  second moment as a collapse signature, not convergence.
+
+`tests/test_gradient_stability.py` reproduces the explosion, asserts forward equivalence
+of the two gradient modes, and requires a short training run to beat both the
+second-moment and constant-velocity baselines with every loss term finite.
+
 ## 📌 Code Structure
 
 ```text
