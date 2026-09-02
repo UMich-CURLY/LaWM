@@ -33,7 +33,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--solver-iters", type=int, default=8)
-    parser.add_argument("--solver-step-size", type=float, default=0.25)
+    # 0.05 matches the LeastActionWorldModel default; the previous 0.25 here silently
+    # trained a different (and numerically far less stable) solver than the model class.
+    parser.add_argument("--solver-step-size", type=float, default=0.05)
+    parser.add_argument(
+        "--solver-grad",
+        choices=("last_iterate", "unrolled"),
+        default="last_iterate",
+        help="'last_iterate' backpropagates through only the final DEL correction "
+        "(identical forward, bounded backward); 'unrolled' is the paper-exact full "
+        "unroll, which overflows fp32 on long rollouts (see tests/test_gradient_stability.py)",
+    )
+    parser.add_argument(
+        "--bptt-grad-clip",
+        type=float,
+        default=10.0,
+        help="per-rollout-step backward norm bound; the constant-velocity initialization "
+        "grows gradients ~1.618^T without it. <=0 disables.",
+    )
     parser.add_argument("--lambda-del", type=float, default=1e-2)
     parser.add_argument("--lambda-reg", type=float, default=1e-4)
     parser.add_argument("--max-train-samples", type=int, default=None)
@@ -53,6 +70,8 @@ def build_model(args: argparse.Namespace, device: torch.device) -> LeastActionWo
         depth=args.depth,
         solver_iters=args.solver_iters,
         solver_step_size=args.solver_step_size,
+        solver_grad=getattr(args, "solver_grad", "last_iterate"),
+        bptt_grad_clip=getattr(args, "bptt_grad_clip", 10.0),
     ).to(device)
 
 
@@ -121,10 +140,12 @@ def train(args: argparse.Namespace) -> None:
         json.dump(vars(args), f, indent=2, default=str)
 
     metrics: Dict[str, float] = {}
+    skipped_nonfinite_total = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = {"loss": 0.0, "traj": 0.0, "del": 0.0, "reg": 0.0}
         count = 0
+        skipped_nonfinite = 0
         for (batch,) in loader:
             batch = batch.to(device)
             out = batch_objective(
@@ -137,6 +158,19 @@ def train(args: argparse.Namespace) -> None:
             )
             optimizer.zero_grad(set_to_none=True)
             out["loss"].backward()
+            # A single non-finite gradient step poisons every parameter, after which the
+            # solver's sanitizers keep producing finite trajectories from a dead model
+            # (traj then settles at the data's second moment and looks like convergence).
+            # Never take that step; count it instead.
+            grads_finite = all(
+                torch.isfinite(p.grad).all()
+                for p in model.parameters()
+                if p.grad is not None
+            )
+            if not grads_finite:
+                skipped_nonfinite += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -145,6 +179,8 @@ def train(args: argparse.Namespace) -> None:
                 running[key] += float(out[key].detach().cpu()) * batch.shape[0]
 
         metrics = {f"train_{key}": value / max(count, 1) for key, value in running.items()}
+        skipped_nonfinite_total += skipped_nonfinite
+        metrics["skipped_nonfinite_steps"] = skipped_nonfinite
         if val_states is not None:
             val_ts = make_time_grid(val_states.shape[1], args.dt, device)
             val_metrics = evaluate(model, val_states, val_ts, weights, args, device)
@@ -159,6 +195,12 @@ def train(args: argparse.Namespace) -> None:
 
     save_checkpoint(args.out_dir / "lawm_final.pth", model, optimizer, args=args, epoch=args.epochs, metrics=metrics)
     print(f"Saved final checkpoint to {args.out_dir / 'lawm_final.pth'}")
+    if skipped_nonfinite_total:
+        print(
+            f"WARNING: skipped {skipped_nonfinite_total} optimizer step(s) with "
+            "non-finite gradients; if this is more than a handful, reduce "
+            "--solver-step-size or keep --solver-grad last_iterate."
+        )
 
 
 def main() -> None:

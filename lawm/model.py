@@ -20,6 +20,8 @@ class LeastActionWorldModel(nn.Module):
         depth: int = 3,
         solver_iters: int = 8,
         solver_step_size: float = 0.05,
+        solver_grad: str = "last_iterate",
+        bptt_grad_clip: float = 10.0,
     ) -> None:
         super().__init__()
         self.state_dim = int(state_dim)
@@ -38,6 +40,8 @@ class LeastActionWorldModel(nn.Module):
             depth=self.depth,
             solver_iters=self.solver_iters,
             solver_step_size=self.solver_step_size,
+            solver_grad=solver_grad,
+            bptt_grad_clip=bptt_grad_clip,
         )
 
     def q_sequence_from_state(self, states: torch.Tensor) -> torch.Tensor:
